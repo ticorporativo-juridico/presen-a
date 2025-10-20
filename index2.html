@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Registro de Presença (Treinamento)</title>
+    <!-- Carregamento do Tailwind CSS para estilização moderna e responsiva -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Configuração de fonte padrão */
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f7;
+        }
+    </style>
+    <script>
+        tailwind.config = {
+            theme: {
+                extend: {
+                    colors: {
+                        'primary-blue': '#1c4587',
+                        'secondary-gold': '#f59e0b',
+                    }
+                }
+            }
+        }
+    </script>
+    <!-- Configuração e Lógica do Firebase/Firestore -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        // Importa funções necessárias para salvar (setDoc) e consultar (collection, getDocs)
+        import { getFirestore, doc, setDoc, collection, getDocs } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { setLogLevel } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // Variáveis globais do ambiente Canvas (MANDATÓRIO USAR)
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'default-app-id';
+        const firebaseConfig = JSON.parse(typeof __firebase_config !== 'undefined' ? __firebase_config : '{}');
+        const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
+
+        let db;
+        let auth;
+        // O caminho da coleção agora usará o ID da reunião para organizar melhor os dados
+        const COLLECTION_PATH = `artifacts/${appId}/public/data/meeting_rsvps`;
+
+        /**
+         * Inicializa o Firebase e autentica o usuário (via token ou anonimamente).
+         */
+        async function initializeFirebase() {
+            if (db) return;
+            try {
+                const app = initializeApp(firebaseConfig);
+                db = getFirestore(app);
+                auth = getAuth(app);
+                setLogLevel('Debug'); // Nível de log para fins de depuração
+
+                if (initialAuthToken) {
+                    try {
+                        // Tenta autenticar com o token customizado
+                        await signInWithCustomToken(auth, initialAuthToken);
+                        console.log("Autenticação com token customizado realizada com sucesso.");
+                    } catch (tokenError) {
+                        // Se o token customizado falhar (auth/invalid-custom-token), faz login anônimo como fallback
+                        console.warn("Falha na autenticação com token customizado. Tentando login anônimo como fallback.", tokenError);
+                        await signInAnonymously(auth);
+                        console.log("Autenticação anônima realizada como fallback.");
+                    }
+                } else {
+                    // Se não houver token, faz login anônimo
+                    await signInAnonymously(auth);
+                    console.log("Autenticação anônima realizada.");
+                }
+                
+                console.log("Firebase e autenticação inicializados com sucesso.");
+            } catch (error) {
+                console.error("Erro ao inicializar Firebase:", error);
+                // Exibe erro na área de RSVP caso a inicialização falhe
+                const statusRsvp = document.getElementById('statusMessage');
+                if (statusRsvp) {
+                    statusRsvp.textContent = "Erro de inicialização do serviço. Tente recarregar.";
+                    statusRsvp.className = 'mt-4 text-sm font-medium text-red-600';
+                }
+            }
+        }
+
+        /**
+         * Lida com o envio do formulário, validando os dados e salvando no Firestore.
+         */
+        window.handleRsvp = async function() {
+            await initializeFirebase();
+            if (!db || !auth.currentUser) return;
+
+            const nameInput = document.getElementById('guestName');
+            const emailInput = document.getElementById('guestEmail');
+            const phoneInput = document.getElementById('guestPhone');
+            const deptInput = document.getElementById('guestDept');
+            const managerInput = document.getElementById('guestManager');
+            const meetingDateInput = document.getElementById('meetingDate');
+            const meetingDurationInput = document.getElementById('meetingDuration');
+            
+            const statusMessage = document.getElementById('statusMessage');
+            const confirmButton = document.getElementById('confirmButton');
+            
+            const name = nameInput.value.trim();
+            const email = emailInput.value.trim();
+            const phone = phoneInput.value.trim();
+            const department = deptInput.value.trim();
+            const manager = managerInput.value.trim();
+            const meetingDate = meetingDateInput.value.trim(); // Novo campo
+            const meetingDuration = meetingDurationInput.value.trim(); // Novo campo
+
+            // Validação de todos os campos agora obrigatórios
+            if (name === "" || email === "" || phone === "" || department === "" || manager === "" || meetingDate === "" || meetingDuration === "") {
+                statusMessage.textContent = "Todos os campos marcados com (*) são obrigatórios para o registro completo.";
+                statusMessage.className = 'mt-4 text-sm font-medium text-red-600';
+                return;
+            }
+            if (!email.includes('@')) {
+                statusMessage.textContent = "Por favor, insira um e-mail válido.";
+                statusMessage.className = 'mt-4 text-sm font-medium text-red-600';
+                return;
+            }
+
+            // Define o estado de carregamento da UI
+            confirmButton.disabled = true;
+            confirmButton.textContent = 'Registrando Presença...';
+            statusMessage.textContent = "Salvando seu registro no banco de dados...";
+            statusMessage.className = 'mt-4 text-sm font-medium text-primary-blue';
+
+            try {
+                const userId = auth.currentUser.uid;
+                
+                // Cria um ID de documento combinado para garantir que a combinação Email+Data seja única
+                // Isso impede que o mesmo colaborador registre presença mais de uma vez para o mesmo evento.
+                const docId = `${email.toLowerCase()}-${meetingDate}`;
+
+                const rsvpData = {
+                    fullName: name,
+                    corporateEmail: email.toLowerCase(),
+                    phone: phone,
+                    department: department,
+                    directManager: manager,
+                    meetingDate: meetingDate, // Salvando o novo campo
+                    meetingDuration: meetingDuration, // Salvando o novo campo
+                    rsvpTimestamp: new Date().toISOString(),
+                    status: 'Presente',
+                    guestUserId: userId,
+                };
+                
+                // Caminho da coleção pública: /artifacts/{appId}/public/data/meeting_rsvps/{docId}
+                const docRef = doc(db, COLLECTION_PATH, docId);
+                await setDoc(docRef, rsvpData);
+                
+                // Estado de sucesso
+                statusMessage.textContent = `Obrigado(a), ${name}! Seu registro de presença para o treinamento em ${meetingDate} foi concluído com sucesso.`;
+                statusMessage.className = 'mt-4 text-lg font-bold text-green-600';
+                
+                // Desabilita campos após sucesso
+                nameInput.disabled = true;
+                emailInput.disabled = true;
+                phoneInput.disabled = true;
+                deptInput.disabled = true;
+                managerInput.disabled = true;
+                meetingDateInput.disabled = true;
+                meetingDurationInput.disabled = true;
+
+
+                confirmButton.classList.remove('bg-primary-blue', 'hover:bg-blue-800');
+                confirmButton.classList.add('bg-gray-400', 'cursor-not-allowed');
+                confirmButton.textContent = 'Presença Registrada';
+
+            } catch (error) {
+                console.error("Erro ao salvar registro no Firestore:", error);
+                confirmButton.disabled = false;
+                confirmButton.textContent = 'REGISTRAR PRESENÇA';
+                statusMessage.textContent = "Erro ao registrar. Verifique sua conexão e tente novamente.";
+                statusMessage.className = 'mt-4 text-sm font-medium text-red-600';
+            }
+        }
+
+        /**
+         * Gera e inicia o download de um relatório CSV com todas as presenças.
+         */
+        window.generateReport = async function() {
+            await initializeFirebase();
+            if (!db || !auth.currentUser) return;
+
+            const reportButton = document.getElementById('reportButton');
+            const reportStatusMessage = document.getElementById('reportStatusMessage');
+
+            reportButton.disabled = true;
+            reportStatusMessage.textContent = 'Extraindo dados...';
+            reportStatusMessage.className = 'mt-4 text-sm font-medium text-primary-blue';
+
+            try {
+                const rsvpCollection = collection(db, COLLECTION_PATH);
+                
+                // Busca todos os documentos na coleção
+                const snapshot = await getDocs(rsvpCollection);
+                
+                if (snapshot.empty) {
+                    reportStatusMessage.textContent = 'Nenhuma presença registrada ainda.';
+                    reportStatusMessage.className = 'mt-4 text-sm font-medium text-gray-600';
+                    return;
+                }
+
+                let csv = '';
+                // Cabeçalhos (Usando ponto e vírgula como separador, comum no Brasil)
+                // Atualizado para incluir Data da Reunião e Duração
+                const headers = ["Nome Completo", "E-mail Corporativo", "Telefone", "Departamento", "Gestor Direto", "Data da Reunião", "Duração", "Status", "Data/Hora Registro"];
+                csv += headers.join(';') + '\n';
+
+                snapshot.forEach((doc) => {
+                    const data = doc.data();
+                    const row = [
+                        data.fullName || '',
+                        data.corporateEmail || '',
+                        data.phone || '',
+                        data.department || '',
+                        data.directManager || '',
+                        data.meetingDate || '', // Novo campo
+                        data.meetingDuration || '', // Novo campo
+                        data.status || 'N/A',
+                        data.rsvpTimestamp ? new Date(data.rsvpTimestamp).toLocaleString('pt-BR') : ''
+                    ];
+                    // Formata a linha, escapando aspas e juntando com ponto e vírgula
+                    const sanitizedRow = row.map(field => `"${field.toString().replace(/"/g, '""')}"`).join(';');
+                    csv += sanitizedRow + '\n';
+                });
+
+                // Cria o Blob (arquivo) e o link de download
+                const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+                const url = URL.createObjectURL(blob);
+                const link = document.createElement('a');
+                link.setAttribute('href', url);
+                link.setAttribute('download', `relatorio_presencas_treinamento_${new Date().toISOString().slice(0, 10)}.csv`);
+                
+                // Simula o clique para iniciar o download
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                
+                reportStatusMessage.textContent = 'Relatório CSV gerado e download iniciado.';
+                reportStatusMessage.className = 'mt-4 text-sm font-medium text-green-600';
+
+            } catch (error) {
+                console.error("Erro ao gerar relatório:", error);
+                reportStatusMessage.textContent = 'Erro ao extrair dados. Verifique o console.';
+                reportStatusMessage.className = 'mt-4 text-sm font-medium text-red-600';
+            } finally {
+                // Reabilita o botão após 5 segundos ou sucesso/falha
+                setTimeout(() => {
+                    reportButton.disabled = false;
+                    reportStatusMessage.textContent = '';
+                }, 5000);
+            }
+        }
+    </script>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+
+    <!-- Cartão Principal do Registro -->
+    <div class="w-full max-w-lg bg-white shadow-2xl rounded-xl p-8 md:p-10 border-t-4 border-primary-blue">
+        
+        <!-- Cabeçalho -->
+        <header class="text-center mb-10">
+            <h1 class="text-3xl md:text-4xl font-extrabold text-primary-blue mb-2">
+                REGISTRO DE PRESENÇA
+            </h1>
+            <p class="text-xl font-semibold text-gray-700">
+                Treinamentos Internos
+            </p>
+        </header>
+
+        <!-- Formulário de REGISTRO DE PRESENÇA -->
+        <section>
+            <h3 class="text-2xl font-bold text-center text-gray-700 mb-4">
+                Preenchimento Obrigatório
+            </h3>
+            
+            <p class="text-center text-gray-500 mb-6 text-sm">
+                Preencha seus dados abaixo e as informações do treinamento para validar sua participação.
+            </p>
+
+            <div class="space-y-4">
+                <!-- Data da Reunião (Novo e Obrigatório) -->
+                <div>
+                    <label for="meetingDate" class="block text-sm font-medium text-gray-700 mb-1">Data da Reunião <span class="text-red-500">*</span></label>
+                    <input type="date" id="meetingDate" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue transition duration-150" 
+                           required>
+                </div>
+
+                <!-- Duração da Reunião (Novo e Obrigatório) -->
+                <div>
+                    <label for="meetingDuration" class="block text-sm font-medium text-gray-700 mb-1">Duração Total (Ex: 90 minutos) <span class="text-red-500">*</span></label>
+                    <input type="text" id="meetingDuration" placeholder="Ex: 2 horas, 90 minutos" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue transition duration-150" 
+                           required>
+                </div>
+
+                <!-- Nome Completo (Obrigatório) -->
+                <div>
+                    <label for="guestName" class="block text-sm font-medium text-gray-700 mb-1">Nome Completo <span class="text-red-500">*</span></label>
+                    <input type="text" id="guestName" placeholder="Seu nome completo" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue transition duration-150" 
+                           required>
+                </div>
+
+                <!-- E-mail Corporativo (Obrigatório, usado como ID no banco) -->
+                <div>
+                    <label for="guestEmail" class="block text-sm font-medium text-gray-700 mb-1">E-mail Corporativo <span class="text-red-500">*</span></label>
+                    <input type="email" id="guestEmail" placeholder="seu.email@empresa.com.br" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue transition duration-150" 
+                           required>
+                </div>
+
+                <!-- Telefone (Obrigatório) -->
+                <div>
+                    <label for="guestPhone" class="block text-sm font-medium text-gray-700 mb-1">Telefone <span class="text-red-500">*</span></label>
+                    <input type="tel" id="guestPhone" placeholder="(XX) XXXXX-XXXX" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue transition duration-150" required>
+                </div>
+
+                <!-- Departamento (Obrigatório) -->
+                <div>
+                    <label for="guestDept" class="block text-sm font-medium text-gray-700 mb-1">Departamento <span class="text-red-500">*</span></label>
+                    <input type="text" id="guestDept" placeholder="Ex: Marketing, Vendas, TI" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue transition duration-150" required>
+                </div>
+
+                <!-- Gestor Direto (Obrigatório) -->
+                <div>
+                    <label for="guestManager" class="block text-sm font-medium text-gray-700 mb-1">Gestor Direto <span class="text-red-500">*</span></label>
+                    <input type="text" id="guestManager" placeholder="Nome do seu gestor" 
+                           class="w-full px-4 py-2 border border-gray-300 rounded-lg shadow-sm focus:ring-primary-blue focus:border-primary-blue transition duration-150" required>
+                </div>
+                
+                <button id="confirmButton" onclick="handleRsvp()"
+                        class="w-full flex justify-center items-center py-3 px-4 border border-transparent text-lg font-bold rounded-lg shadow-md text-white bg-primary-blue hover:bg-blue-800 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-primary-blue transition duration-200">
+                    REGISTRAR PRESENÇA
+                </button>
+            </div>
+
+            <!-- Mensagem de Status (Feedback ao Usuário) -->
+            <div id="statusMessage" class="text-center h-6 mt-4">
+                <!-- A mensagem de status aparecerá aqui -->
+            </div>
+        </section>
+        
+        <!-- Seção de Relatório -->
+        <section class="mt-12 pt-6 border-t border-gray-200">
+            <h3 class="text-xl font-bold text-center text-gray-700 mb-4">
+                Extrair Relatório
+            </h3>
+            
+            <button id="reportButton" onclick="generateReport()"
+                    class="w-full flex justify-center items-center py-3 px-4 border border-transparent text-md font-bold rounded-lg shadow-md text-white bg-secondary-gold hover:bg-yellow-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-secondary-gold transition duration-200">
+                <svg class="w-5 h-5 mr-2" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg>
+                Baixar Relatório de Presenças (CSV)
+            </button>
+            
+            <!-- Mensagem de Status do Relatório -->
+            <div id="reportStatusMessage" class="text-center h-6 mt-4">
+                <!-- Status da extração do relatório aparecerá aqui -->
+            </div>
+            
+            <p class="mt-8 text-xs text-gray-400 text-center">Os dados são armazenados de forma segura e persistente no banco de dados Firestore.</p>
+        </section>
+
+    </div>
+
+</body>
+</html>
